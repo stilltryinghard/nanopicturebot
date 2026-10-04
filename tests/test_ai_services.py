@@ -1,6 +1,7 @@
 from __future__ import annotations
 import json
 import pytest
+from unittest.mock import patch, AsyncMock
 from aioresponses import aioresponses
 
 from services.ai.base import GenerationRequest, GenerationResult
@@ -289,6 +290,11 @@ class TestMidjourneyService:
             result = await svc.generate(request)
 
         assert len(result.images) == 1
+        
+    @pytest.fixture(autouse=True)
+    def no_sleep(self):
+        with patch("services.ai.midjourney.asyncio.sleep", new=AsyncMock()):
+            yield
 
     async def test_generate_with_4k_quality(self):
         """4K добавляет --q 2 к промту"""
