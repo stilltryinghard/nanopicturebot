@@ -1,7 +1,7 @@
 from __future__ import annotations
 from datetime import datetime, timedelta
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, update
 from db.models.transaction import Transaction
 
 
@@ -38,6 +38,24 @@ class TransactionRepository:
         if transaction:
             transaction.status = status
             await self.session.commit()
+            
+        async def mark_success_if_pending(self, payment_id: str) -> Transaction | None:
+            """
+        Атомарно переводит транзакцию pending → success одним UPDATE.
+        Возвращает транзакцию, только если перевёл именно этот вызов,
+        иначе None (уже обработана параллельным запросом).
+        Не коммитит: вызывающий коммитит вместе с начислением.
+        """
+        result = await self.session.execute(
+            update(Transaction)
+            .where(
+                Transaction.payment_id == payment_id,
+                Transaction.status == "pending",
+            )
+            .values(status="success")
+            .returning(Transaction)
+        )
+        return result.scalar_one_or_none()
 
     async def get_by_payment_id(self, payment_id: str) -> Transaction | None:
         result = await self.session.execute(

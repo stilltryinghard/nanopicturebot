@@ -101,28 +101,36 @@ async def yukassa_webhook(request: Request):
             )
             return {"status": "ok"}
 
+        # Атомарно забираем платёж в обработку: из параллельных дублей
+        # статус pending → success сменит только один запрос
+        claimed = await trans_repo.mark_success_if_pending(payment_id)
+        if claimed is None:
+            logger.info(f"Webhook: платёж {payment_id} уже обработан параллельно")
+            return {"status": "ok"}
+
         # Что начислять — берём из нашей транзакции, а не из metadata
-        user_id = transaction.user_id
-        tokens = transaction.tokens
+        user_id = claimed.user_id
+        tokens = claimed.tokens
         plan: str | None = None
 
-        if transaction.type.startswith("subscription_"):
-            plan = transaction.type.removeprefix("subscription_")
+        if claimed.type.startswith("subscription_"):
+            plan = claimed.type.removeprefix("subscription_")
             await sub_repo.upsert(
                 user_id=user_id,
                 plan=plan,
-                expires_at=datetime.now() + timedelta(days=30),
+                expires_at=datetime.now() + timedelta(days=30),  # noqa: DTZ005 — в проекте naive-время
             )
             logger.info(f"Webhook: подписка {plan} активирована для юзера {user_id}")
         else:
             await user_repo.update_tokens(user_id, amount=tokens)
             logger.info(f"Webhook: начислено {tokens} токенов юзеру {user_id}")
 
-        await trans_repo.update_status(payment_id, "success")
+        # Статус и начисление — одним коммитом: упадёт начисление, откатится и статус
+        await session.commit()
 
     try:
         await notify_user(user_id, plan, tokens)
-    except Exception:
+    except Exception:  # noqa: BLE001 — граница: уведомление не должно ронять вебхук
         # Деньги уже зачислены — падение уведомления не должно ронять вебхук,
         # иначе ЮКасса будет слать его повторно
         logger.exception(f"Webhook: не удалось уведомить юзера {user_id}")

@@ -89,7 +89,9 @@ async def test_non_payment_event_ignored(client):
 
 async def test_token_purchase_credits_from_transaction_not_metadata(client, repos):
     # В metadata — попытка накрутить миллион токенов
-    repos.trans.get_by_payment_id.return_value = _tx(tokens=100, amount=99.0)
+    tx = _tx(tokens=100, amount=99.0)
+    repos.trans.get_by_payment_id.return_value = tx
+    repos.trans.mark_success_if_pending.return_value = tx
 
     with _fetch_returns(_payment(value="99.00")):
         resp = await client.post(
@@ -100,14 +102,14 @@ async def test_token_purchase_credits_from_transaction_not_metadata(client, repo
     assert resp.status_code == 200
     # Начислено по транзакции: юзер 111, 100 токенов
     repos.user.update_tokens.assert_called_once_with(111, amount=100)
-    repos.trans.update_status.assert_called_once_with("pay_tok", "success")
+    repos.trans.mark_success_if_pending.assert_called_once_with("pay_tok")
     repos.notify.assert_called_once_with(111, None, 100)
 
 
 async def test_subscription_activates_plan_from_transaction_type(client, repos):
-    repos.trans.get_by_payment_id.return_value = _tx(
-        type_="subscription_pro", tokens=0, amount=999.0, user_id=222
-    )
+    tx = _tx(type_="subscription_pro", tokens=0, amount=999.0, user_id=222)
+    repos.trans.get_by_payment_id.return_value = tx
+    repos.trans.mark_success_if_pending.return_value = tx
 
     with _fetch_returns(_payment(value="999.00")):
         resp = await client.post("/webhook/yukassa", json=_event("pay_sub"))
@@ -118,7 +120,7 @@ async def test_subscription_activates_plan_from_transaction_type(client, repos):
     assert kwargs["plan"] == "pro"
     assert kwargs["user_id"] == 222
     repos.user.update_tokens.assert_not_called()
-    repos.trans.update_status.assert_called_once_with("pay_sub", "success")
+    repos.trans.mark_success_if_pending.assert_called_once_with("pay_sub")
 
 
 async def test_fake_payment_not_found_in_yukassa(client, repos):
@@ -157,7 +159,7 @@ async def test_duplicate_payment_ignored(client, repos):
 
     assert resp.status_code == 200
     repos.user.update_tokens.assert_not_called()
-    repos.trans.update_status.assert_not_called()
+    repos.trans.mark_success_if_pending.assert_not_called()
 
 
 async def test_amount_mismatch_ignored(client, repos):
@@ -169,7 +171,7 @@ async def test_amount_mismatch_ignored(client, repos):
 
     assert resp.status_code == 200
     repos.user.update_tokens.assert_not_called()
-    repos.trans.update_status.assert_not_called()
+    repos.trans.mark_success_if_pending.assert_not_called()
 
 
 async def test_yukassa_unavailable_returns_503(client, repos):
@@ -183,7 +185,9 @@ async def test_yukassa_unavailable_returns_503(client, repos):
 
 
 async def test_notify_failure_does_not_break_webhook(client, repos):
-    repos.trans.get_by_payment_id.return_value = _tx()
+    tx = _tx()
+    repos.trans.get_by_payment_id.return_value = tx
+    repos.trans.mark_success_if_pending.return_value = tx
     repos.notify.side_effect = RuntimeError("telegram is down")
 
     with _fetch_returns(_payment()):
@@ -192,3 +196,17 @@ async def test_notify_failure_does_not_break_webhook(client, repos):
     # Деньги зачислены, падение уведомления не роняет ответ
     assert resp.status_code == 200
     repos.user.update_tokens.assert_called_once()
+
+
+async def test_parallel_duplicate_loses_race(client, repos):
+    # Оба запроса прочитали pending, но UPDATE выиграл другой: этот не начисляет
+    repos.trans.get_by_payment_id.return_value = _tx(status="pending")
+    repos.trans.mark_success_if_pending.return_value = None
+
+    with _fetch_returns(_payment()):
+        resp = await client.post("/webhook/yukassa", json=_event("pay_race"))
+
+    assert resp.status_code == 200
+    repos.user.update_tokens.assert_not_called()
+    repos.sub.upsert.assert_not_called()
+    repos.notify.assert_not_called()
