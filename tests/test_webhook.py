@@ -1,37 +1,82 @@
 from __future__ import annotations
-import pytest
+
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
-from httpx import AsyncClient, ASGITransport
+
+import httpx
+import pytest
+from httpx import ASGITransport, AsyncClient
+
 from webhook.app import app
 
+# ---------- хелперы ----------
 
-def _payment_event(
-    user_id: int, tokens: int, plan: str | None = None, payment_id: str = "pay_001"
-):
-    metadata = {"user_id": str(user_id), "tokens": str(tokens)}
-    if plan:
-        metadata["plan"] = plan
+
+def _event(payment_id: str = "pay_001", metadata: dict | None = None) -> dict:
+    """Тело вебхука. metadata можно подделать — вебхук не должен ей верить."""
     return {
         "event": "payment.succeeded",
-        "object": {
-            "id": payment_id,
-            "metadata": metadata,
-        },
+        "object": {"id": payment_id, "metadata": metadata or {}},
     }
 
 
-@pytest.fixture
-def mock_session_ctx():
-    session = AsyncMock()
-    ctx = MagicMock()
-    ctx.__aenter__ = AsyncMock(return_value=session)
-    ctx.__aexit__ = AsyncMock(return_value=False)
-    return ctx, session
+def _payment(status: str = "succeeded", paid: bool = True, value: str = "99.00") -> dict:
+    """Ответ API ЮКассы на GET /payments/{id}."""
+    return {
+        "status": status,
+        "paid": paid,
+        "amount": {"value": value, "currency": "RUB"},
+    }
+
+
+def _tx(
+    type_: str = "purchase",
+    tokens: int = 100,
+    amount: float = 99.0,
+    status: str = "pending",
+    user_id: int = 111,
+) -> SimpleNamespace:
+    """Транзакция из нашей базы — единственный источник правды о начислении."""
+    return SimpleNamespace(
+        type=type_, tokens=tokens, amount=amount, status=status, user_id=user_id
+    )
+
+
+# ---------- фикстуры ----------
 
 
 @pytest.fixture
 def client():
     return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+
+
+@pytest.fixture
+def repos():
+    """Подменяем сессию, репозитории и уведомление там, где их использует вебхук."""
+    session = AsyncMock()
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(return_value=session)
+    ctx.__aexit__ = AsyncMock(return_value=False)
+
+    trans_repo = AsyncMock()
+    user_repo = AsyncMock()
+    sub_repo = AsyncMock()
+
+    with (
+        patch("webhook.app.async_session_maker", return_value=ctx),
+        patch("webhook.app.TransactionRepository", return_value=trans_repo),
+        patch("webhook.app.UserRepository", return_value=user_repo),
+        patch("webhook.app.SubscriptionRepository", return_value=sub_repo),
+        patch("webhook.app.notify_user", new=AsyncMock()) as notify,
+    ):
+        yield SimpleNamespace(trans=trans_repo, user=user_repo, sub=sub_repo, notify=notify)
+
+
+def _fetch_returns(value):
+    return patch("webhook.app.fetch_payment", new=AsyncMock(return_value=value))
+
+
+# ---------- тесты ----------
 
 
 async def test_non_payment_event_ignored(client):
@@ -42,132 +87,108 @@ async def test_non_payment_event_ignored(client):
     assert resp.json() == {"status": "ok"}
 
 
-async def test_missing_user_id_ignored(client, mock_session_ctx):
-    ctx, session = mock_session_ctx
-    trans_repo = AsyncMock()
-    trans_repo.get_by_payment_id = AsyncMock(return_value=None)
+async def test_token_purchase_credits_from_transaction_not_metadata(client, repos):
+    # В metadata — попытка накрутить миллион токенов
+    repos.trans.get_by_payment_id.return_value = _tx(tokens=100, amount=99.0)
 
-    # Вебхук делает lazy import внутри функции, патчим источники
-    with (
-        patch("db.session.async_session_maker", return_value=ctx),
-        patch(
-            "db.repositories.transaction.TransactionRepository", return_value=trans_repo
-        ),
-    ):
+    with _fetch_returns(_payment(value="99.00")):
         resp = await client.post(
             "/webhook/yukassa",
-            json={
-                "event": "payment.succeeded",
-                "object": {"id": "pay_x", "metadata": {"tokens": "100"}},
-            },
+            json=_event("pay_tok", metadata={"user_id": "666", "tokens": "1000000"}),
         )
 
     assert resp.status_code == 200
+    # Начислено по транзакции: юзер 111, 100 токенов
+    repos.user.update_tokens.assert_called_once_with(111, amount=100)
+    repos.trans.update_status.assert_called_once_with("pay_tok", "success")
+    repos.notify.assert_called_once_with(111, None, 100)
 
 
-async def test_token_purchase_credits_tokens(client, mock_session_ctx):
-    ctx, _ = mock_session_ctx
+async def test_subscription_activates_plan_from_transaction_type(client, repos):
+    repos.trans.get_by_payment_id.return_value = _tx(
+        type_="subscription_pro", tokens=0, amount=999.0, user_id=222
+    )
 
-    trans_repo = AsyncMock()
-    trans_repo.get_by_payment_id = AsyncMock(return_value=None)
-    trans_repo.update_status = AsyncMock()
-
-    user_repo = AsyncMock()
-    user_repo.update_tokens = AsyncMock()
-
-    mock_bot = AsyncMock()
-    mock_bot.send_message = AsyncMock()
-
-    with (
-        patch("db.session.async_session_maker", return_value=ctx),
-        patch(
-            "db.repositories.transaction.TransactionRepository", return_value=trans_repo
-        ),
-        patch("db.repositories.user.UserRepository", return_value=user_repo),
-        patch(
-            "db.repositories.subscription.SubscriptionRepository",
-            return_value=AsyncMock(),
-        ),
-        patch("aiogram.Bot") as MockBot,
-    ):
-        MockBot.return_value.__aenter__ = AsyncMock(return_value=mock_bot)
-        MockBot.return_value.__aexit__ = AsyncMock(return_value=False)
-
-        resp = await client.post(
-            "/webhook/yukassa",
-            json=_payment_event(user_id=111, tokens=100, payment_id="pay_tok"),
-        )
+    with _fetch_returns(_payment(value="999.00")):
+        resp = await client.post("/webhook/yukassa", json=_event("pay_sub"))
 
     assert resp.status_code == 200
-    user_repo.update_tokens.assert_called_once_with(111, amount=100)
-    trans_repo.update_status.assert_called_once_with("pay_tok", "success")
+    repos.sub.upsert.assert_called_once()
+    kwargs = repos.sub.upsert.call_args.kwargs
+    assert kwargs["plan"] == "pro"
+    assert kwargs["user_id"] == 222
+    repos.user.update_tokens.assert_not_called()
+    repos.trans.update_status.assert_called_once_with("pay_sub", "success")
 
 
-async def test_subscription_activates_plan(client, mock_session_ctx):
-    ctx, _ = mock_session_ctx
-
-    trans_repo = AsyncMock()
-    trans_repo.get_by_payment_id = AsyncMock(return_value=None)
-    trans_repo.update_status = AsyncMock()
-
-    user_repo = AsyncMock()
-    sub_repo = AsyncMock()
-    sub_repo.create = AsyncMock()
-
-    mock_bot = AsyncMock()
-    mock_bot.send_message = AsyncMock()
-
-    with (
-        patch("db.session.async_session_maker", return_value=ctx),
-        patch(
-            "db.repositories.transaction.TransactionRepository", return_value=trans_repo
-        ),
-        patch("db.repositories.user.UserRepository", return_value=user_repo),
-        patch(
-            "db.repositories.subscription.SubscriptionRepository", return_value=sub_repo
-        ),
-        patch("aiogram.Bot") as MockBot,
-    ):
-        MockBot.return_value.__aenter__ = AsyncMock(return_value=mock_bot)
-        MockBot.return_value.__aexit__ = AsyncMock(return_value=False)
-
-        resp = await client.post(
-            "/webhook/yukassa",
-            json=_payment_event(
-                user_id=222, tokens=0, plan="pro", payment_id="pay_sub"
-            ),
-        )
+async def test_fake_payment_not_found_in_yukassa(client, repos):
+    with _fetch_returns(None):
+        resp = await client.post("/webhook/yukassa", json=_event("pay_fake"))
 
     assert resp.status_code == 200
-    sub_repo.create.assert_called_once()
-    call_kwargs = sub_repo.create.call_args.kwargs
-    assert call_kwargs["plan"] == "pro"
-    assert call_kwargs["user_id"] == 222
-    user_repo.update_tokens.assert_not_called()
+    repos.user.update_tokens.assert_not_called()
+    repos.sub.upsert.assert_not_called()
 
 
-async def test_duplicate_payment_ignored(client, mock_session_ctx):
-    ctx, _ = mock_session_ctx
-
-    existing_tx = MagicMock()
-    existing_tx.status = "success"
-
-    trans_repo = AsyncMock()
-    trans_repo.get_by_payment_id = AsyncMock(return_value=existing_tx)
-
-    user_repo = AsyncMock()
-
-    with (
-        patch("db.session.async_session_maker", return_value=ctx),
-        patch(
-            "db.repositories.transaction.TransactionRepository", return_value=trans_repo
-        ),
-        patch("db.repositories.user.UserRepository", return_value=user_repo),
-    ):
-        resp = await client.post(
-            "/webhook/yukassa",
-            json=_payment_event(user_id=333, tokens=100, payment_id="pay_dup"),
-        )
+async def test_payment_not_succeeded_in_yukassa(client, repos):
+    # Тело говорит succeeded, а API — pending: верим API
+    with _fetch_returns(_payment(status="pending", paid=False)):
+        resp = await client.post("/webhook/yukassa", json=_event("pay_pending"))
 
     assert resp.status_code == 200
-    user_repo.update_tokens.assert_not_called()
+    repos.user.update_tokens.assert_not_called()
+
+
+async def test_unknown_transaction_ignored(client, repos):
+    repos.trans.get_by_payment_id.return_value = None
+
+    with _fetch_returns(_payment()):
+        resp = await client.post("/webhook/yukassa", json=_event("pay_unknown"))
+
+    assert resp.status_code == 200
+    repos.user.update_tokens.assert_not_called()
+
+
+async def test_duplicate_payment_ignored(client, repos):
+    repos.trans.get_by_payment_id.return_value = _tx(status="success")
+
+    with _fetch_returns(_payment()):
+        resp = await client.post("/webhook/yukassa", json=_event("pay_dup"))
+
+    assert resp.status_code == 200
+    repos.user.update_tokens.assert_not_called()
+    repos.trans.update_status.assert_not_called()
+
+
+async def test_amount_mismatch_ignored(client, repos):
+    # Выставили 99, а оплачено 1 — не начисляем
+    repos.trans.get_by_payment_id.return_value = _tx(amount=99.0)
+
+    with _fetch_returns(_payment(value="1.00")):
+        resp = await client.post("/webhook/yukassa", json=_event("pay_cheap"))
+
+    assert resp.status_code == 200
+    repos.user.update_tokens.assert_not_called()
+    repos.trans.update_status.assert_not_called()
+
+
+async def test_yukassa_unavailable_returns_503(client, repos):
+    # 5xx — сигнал ЮКассе повторить уведомление позже
+    failing = AsyncMock(side_effect=httpx.ConnectError("boom"))
+    with patch("webhook.app.fetch_payment", new=failing):
+        resp = await client.post("/webhook/yukassa", json=_event("pay_down"))
+
+    assert resp.status_code == 503
+    repos.user.update_tokens.assert_not_called()
+
+
+async def test_notify_failure_does_not_break_webhook(client, repos):
+    repos.trans.get_by_payment_id.return_value = _tx()
+    repos.notify.side_effect = RuntimeError("telegram is down")
+
+    with _fetch_returns(_payment()):
+        resp = await client.post("/webhook/yukassa", json=_event("pay_notify"))
+
+    # Деньги зачислены, падение уведомления не роняет ответ
+    assert resp.status_code == 200
+    repos.user.update_tokens.assert_called_once()

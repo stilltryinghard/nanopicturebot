@@ -1,5 +1,7 @@
 from __future__ import annotations
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
 from core.i18n import t
 
 
@@ -34,7 +36,9 @@ async def token_packages_kb(lang: str = "ru") -> InlineKeyboardMarkup:
                     tokens=str(p["tokens"]),
                     amount=str(p["amount"]),
                 ),
-                callback_data=f"package:{p['tokens']}:{p['amount']}",
+                # Только идентификатор пакета: цену хендлер берёт из настроек,
+                # потому что callback_data клиент может подделать
+                callback_data=f"package:{p['tokens']}",
             )
         ]
         for p in packages
@@ -54,7 +58,8 @@ async def subscription_plans_kb(lang: str = "ru") -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(
                 text=f"{p['label']} — {p['amount']}₽{per_month}",
-                callback_data=f"sub:{p['plan']}:{p['amount']}",
+                # Только идентификатор тарифа, цена — из настроек
+                callback_data=f"sub:{p['plan']}",
             )
         ]
         for p in plans

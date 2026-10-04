@@ -138,6 +138,18 @@ TEXTS: dict[str, dict[str, str]] = {
         "ru": "✅ <b>Токены зачислены!</b>\n\nНачислено: <b>{tokens} токенов</b>\nСумма: <b>{amount}₽</b>",
         "en": "✅ <b>Tokens added!</b>\n\nAdded: <b>{tokens} tokens</b>\nAmount: <b>{amount}₽</b>",
     },
+        "bal_pay_prompt": {
+        "ru": "💳 <b>К оплате: {amount}₽</b>\n\nНажми кнопку ниже, чтобы перейти к оплате. Токены начислятся автоматически после подтверждения платежа.",
+        "en": "💳 <b>Amount due: {amount}₽</b>\n\nTap the button below to pay. Tokens will be added automatically once the payment is confirmed.",
+    },
+    "bal_package_unavailable": {
+        "ru": "Этот вариант больше недоступен. Открой меню заново.",
+        "en": "This option is no longer available. Please reopen the menu.",
+    },
+    "bal_payment_error": {
+        "ru": "Не удалось создать платёж. Попробуй позже.",
+        "en": "Couldn't create the payment. Please try again later.",
+    },
     "bal_sub_title": {
         "ru": "👑 <b>Подписка</b>\n\n<b>Преимущества подписки:</b>\n• Приоритет в очереди генерации\n• Бонусные токены каждый месяц\n• Скидка на пакеты токенов\n\nВыбери тариф:",
         "en": "👑 <b>Subscription</b>\n\n<b>Subscription benefits:</b>\n• Priority in the generation queue\n• Bonus tokens every month\n• Discount on token packages\n\nChoose a plan:",

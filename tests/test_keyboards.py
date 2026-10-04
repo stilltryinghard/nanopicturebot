@@ -33,12 +33,8 @@ class TestBalanceKeyboards:
             if btn.callback_data
         ]
         package_data = [d for d in all_data if d.startswith("package:")]
-        assert len(package_data) >= 1
-        for d in package_data:
-            parts = d.split(":")
-            assert len(parts) == 3
-            assert parts[1].isdigit()
-            assert parts[2].isdigit()
+        # Цены в callback_data быть не должно: её можно подделать
+        assert package_data == ["package:100", "package:300"]
 
     async def test_subscription_plans_kb(self):
         from unittest.mock import AsyncMock, patch
@@ -61,10 +57,8 @@ class TestBalanceKeyboards:
             if btn.callback_data
         ]
         sub_data = [d for d in all_data if d.startswith("sub:")]
-        assert len(sub_data) >= 1
-        for d in sub_data:
-            parts = d.split(":")
-            assert len(parts) == 3  # sub:plan:amount
+        # Только идентификатор тарифа, без цены
+        assert sub_data == ["sub:basic", "sub:pro"]
 
 
 class TestGenerateKeyboards:
